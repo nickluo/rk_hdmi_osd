@@ -1,0 +1,11 @@
+ab_test/
+.vscode/
+snapshots/
+
+# build outputs
+*.o
+*.a
+osd_demo
+probe8
+probe9
+probe10

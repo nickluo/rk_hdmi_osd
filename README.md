@@ -1,4 +1,4 @@
-# AR0234 → RGA 硬件 OSD 叠加 → HDMI NTSC 输出 (RK3576)
+# AR0234 / SC233HGS → RGA 硬件 OSD 叠加 → HDMI NTSC 输出 (RK3576)
 
 在 RK3576 (Firefly, Ubuntu 22.04, kernel 6.1.141-rt52) 上实现并验证：
 
@@ -19,6 +19,44 @@ DRM/KMS 双缓冲页翻转 ──────────────► 主 pla
         per-pixel α 脉冲) ──► overlay plane (Esmart2, plane α=235,
                                       Coverage, zpos=1)
 ```
+
+## SC233HGS 支持（HZ-RK3576 BSP）
+
+同一 `hw::MipiCamera` 现在支持两颗传感器，`--sensor` 选择：
+
+| | AR0234M（默认 `--sensor ar0234` 恢复旧行为） | SC233HGS（默认） |
+| --- | --- | --- |
+| 驱动 | VEYE mvcam（vendor subdev） | 内核 in-tree 驱动（BSP 单目定制） |
+| 模式 | Y8_1X8 1920x1200@60 | Y10_1X10 1920x1200@60（双目：`--cam 0` / `--cam 1`） |
+| 采集格式 | `V4L2_PIX_FMT_GREY`（RGA Y400 直入） | `V4L2_PIX_FMT_Y10`（LE 位流打包，见下） |
+| Y10 → Y8 | — | CPU 解包到 dma-heap 灰度 scratch 再走 RGA |
+| 管线定位 | 固定 `/dev/video0` + `media-ctl` 实体名 | 扫描 `/dev/media0..7`：含 `m0X_b_sc233hgs` 实体的 graph → 同 graph 的 `stream_cif_mipi_id0` 节点 |
+
+**rkcif 的 `Y10 ` 内存布局（真机实测）**：既不是 V4L2 规范的 16bit 容器，也不是
+MIPI 式"2bit 尾字节"分组，而是**连续小端位流**（字节内 LSB 在前，每样本 10bit）。
+每 5 字节 4 像素：`p0=b0|(b1&3)<<8; p1=b1>>2|(b2&0xf)<<6; p2=b2>>4|(b3&0x3f)<<4;
+p3=b3>>6|b4<<2`。行有效字节 = w×10/8（1920→2400），stride 对齐到 256（2560），
+行尾 padding 为 0。验证方法：`test_cam` 打印布局探测，或抓帧后按上述公式解码
+（MIPI 式解出的是噪声，此式解出的是清晰场景）。注意传感器模组安装方向可能使
+图像旋转 90°（演示画面所见即传感器原生方向，如需转正由显示侧处理）。
+
+### 帧时间戳（SOF → Epoch）
+
+rkcif 驱动在 **SOF 硬中断**里用 `ktime_get_raw_ts64()` 给每帧打
+CLOCK_MONOTONIC_RAW 时间戳（BSP 已定制），随 `v4l2_buffer.timestamp`
+（µs）交付。`hw::Sof2Epoch`（`hw/sof2epoch.h`）把它映射到 Epoch：
+
+```cpp
+hw::CameraBase::Frame f = cam.capture();
+f.sof_raw_ns;   // 驱动 SOF 打点，CLOCK_MONOTONIC_RAW 域
+f.epoch_ns;     // sof2epoch 线性模型映射的 CLOCK_REALTIME（ns）
+f.sequence;     // 驱动帧序号
+```
+
+模型 `epoch = rt_anchor + rate*(raw - raw_anchor)`：RAW/REALTIME/RAW 三明治
+采样定锚，后台线程周期重校准，>500ppm 速率离群判定为系统时间 step 只换锚；
+`adjtimex` 的 NTP 频率修正作 rate 先验。x86 实测转换误差 < ±2µs（受 v4l2
+µs 截断与 ISR 抖动兜底）。OSD 时钟槽显示的即当前帧 SOF 的 Epoch 时间。
 
 检测框是持续移动的特殊元素：独立 overlay plane 使其与 HUD 层**永不互相破坏**，
 压过 HUD 文字/分划时 VOP 硬件做真半透明叠加（文字透出），锁定目标时 per-pixel
@@ -128,7 +166,8 @@ invalidate、检测框每帧仅清旧足迹区域。
 | ---- | ---- |
 | `osd/osd.h` `osd/osd.cpp` | **libosd**：OSD 库，纯 CPU 光栅化 + dma-heap，不依赖任何厂商库（`libosd.a`） |
 | `hw/image.h` | `hw::ImageDesc`：与厂商无关的 dmabuf 图像描述（各层之间的通用语言） |
-| `hw/camera.h` `hw/camera.cpp` | `hw::CameraBase` 抽象接口 + `hw::MipiCamera`：V4L2 采集 + dmabuf 导出 |
+| `hw/camera.h` `hw/camera.cpp` | `hw::CameraBase` 抽象接口 + `hw::MipiCamera`：V4L2 采集 + dmabuf 导出，AR0234M/SC233HGS 双传感器 + SOF 时间戳 |
+| `hw/sof2epoch.h` `hw/sof2epoch.cpp` | `hw::Sof2Epoch`：CLOCK_MONOTONIC_RAW(SOF) → CLOCK_REALTIME(Epoch) 线性模型转换器（后台校准线程） |
 | `hw/display.h` `hw/display.cpp` | `hw::HdmiDisplay`：DRM/KMS 双缓冲 + overlay plane |
 | `hw/compositor.h` `hw/compositor.cpp` | `hw::Compositor`：**全工程唯一使用 RGA 的地方**，封装 NV12 中转与三步硅后端 |
 | `osd_demo.cpp` | 全功能演示：管线编排 + libosd + 模拟双目标 AI 检测 + 遥测 |
@@ -150,8 +189,11 @@ make LIBRGA=/home/firefly/workspace/librga probes     # probe8/9/10（不在默�
 ## 运行（板上）
 
 ```bash
-sudo systemctl stop lightdm          # 释放 DRM master 给本程序
+sudo systemctl stop lightdm          # 释放 DRM master 给本程序（必须：lightdm 与本程序
+                                     # 争抢 DRM 会造成偶发 PageFlip EBUSY）
 sudo ./osd_demo                      # 检测框+遥测+锁定（模拟数据）
+# NV12 ISP 路径（video22，需保持 rkaiq_3A 运行提供 3A）：
+sudo ./osd_demo --sensor sc233hgs-isp
 # 定长运行 + 快照：
 sudo ./osd_demo --frames 360 --snapframe 180
 sudo systemctl start lightdm         # 恢复桌面
@@ -176,8 +218,8 @@ EOF
 ## 参数
 
 ```text
--d 视频节点 (默认 /dev/video0)   -m media 节点 (默认 /dev/media0)
--e 传感器实体名                  -W/-H/-F 相机宽高/帧率 (1920/1200/60)
+-S 传感器: sc233hgs (默认) | ar0234
+-c SC233HGS 模块号 0/1 (默认 0, 对应 m00_b_/m01_b_)
 -n 运行 N 帧后退出               -s 第 N 帧转储快照 (默认 120, -1 禁用)
 -o 快照输出目录 (默认 /tmp)
 ```

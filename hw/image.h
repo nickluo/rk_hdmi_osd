@@ -11,7 +11,9 @@
 namespace hw {
 
 enum class PixelFormat {
-    Gray8,      /* single luma plane (Y400) */
+    Gray8,      /* single luma plane (Y400), one byte per pixel */
+    Y10,        /* 10-bit greyscale, LE packed bitstream (rkcif 'Y10 '),
+                   1.25 B/px - never passed to RGA, down-converted first */
     NV12,       /* luma plane + interleaved chroma plane */
     BGRX8888,   /* memory order B,G,R,X - what DRM calls XRGB8888 */
     RGBA8888,   /* memory order R,G,B,A */
@@ -19,7 +21,8 @@ enum class PixelFormat {
 
 constexpr int bytes_per_pixel(PixelFormat f)
 {
-    return (f == PixelFormat::BGRX8888 || f == PixelFormat::RGBA8888) ? 4 : 1;
+    return (f == PixelFormat::BGRX8888 || f == PixelFormat::RGBA8888) ? 4
+         : (f == PixelFormat::Y10) ? 2 : 1;   /* Y10 value unused for RGA */
 }
 
 struct Rect { int x = 0, y = 0, w = 0, h = 0; };

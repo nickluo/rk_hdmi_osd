@@ -41,6 +41,9 @@ public:
      * math is wrong for partially transparent sources. */
     bool set_overlay(const ImageDesc &overlay);
 
+    /* Y10 frames (SC233HGS) are unpacked to Gray8 on the CPU before the
+     * RGA passes: RGA has no 10-bit luma input, and rkcif writes 'Y10 '
+     * as a little-endian packed bitstream (see compositor.cpp). */
     bool render(const ImageDesc &video, const ImageDesc &dst);
 
 private:
@@ -50,11 +53,19 @@ private:
      * is tiny (camera buffers + 2 framebuffers + overlay + scratch) */
     void *handle_for(const ImageDesc &img);
 
+    bool ensure_y8_scratch_(int width, int height);
+    void y10_to_y8_(const ImageDesc &src);
+
     Config m_cfg;
     int m_scratch_fd = -1;
     void *m_scratch_va = nullptr;
     size_t m_scratch_size = 0;
     void *m_scratch_handle = nullptr;
+
+    int m_y8_fd = -1;
+    void *m_y8_va = nullptr;
+    size_t m_y8_size = 0;
+    int m_y8_w = 0, m_y8_h = 0, m_y8_stride = 0;
 
     ImageDesc m_overlay;
     Slot m_slots[16] = {};

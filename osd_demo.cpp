@@ -69,6 +69,8 @@ struct opts {
     hw::HdmiDisplay::Config disp;
     const char *out_dir = "/tmp";
     int frames = 0, snapframe = 120;
+    const char *sensor = "sc233hgs";   /* "sc233hgs" | "ar0234" */
+    int cam_idx = 0;                   /* SC233HGS module 0/1 */
 };
 
 /* ------------------------------------------------------------------ */
@@ -113,21 +115,36 @@ int main(int argc, char **argv)
         {"frames", required_argument, 0, 'n'},
         {"snapframe", required_argument, 0, 's'},
         {"outdir", required_argument, 0, 'o'},
+        {"sensor", required_argument, 0, 'S'},
+        {"cam", required_argument, 0, 'c'},
         {0, 0, 0, 0},
     };
     int ch;
-    while ((ch = getopt_long(argc, argv, "n:s:o:", longopts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "n:s:o:S:c:", longopts, NULL)) != -1) {
         switch (ch) {
         case 'n': o.frames = atoi(optarg); break;
         case 's': o.snapframe = atoi(optarg); break;
         case 'o': o.out_dir = optarg; break;
+        case 'S': o.sensor = optarg; break;
+        case 'c': o.cam_idx = atoi(optarg); break;
         default: return 1;
         }
     }
+    if (strcmp(o.sensor, "ar0234") == 0)
+        o.cam.sensor = hw::CameraBase::Sensor::Ar0234M;
+    else if (strcmp(o.sensor, "sc233hgs-isp") == 0)
+        o.cam.sensor = hw::CameraBase::Sensor::Sc233hgsIsp;
+    else
+        o.cam.sensor = hw::CameraBase::Sensor::Sc233hgs;
+    o.cam.camera_index = o.cam_idx;
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
-    LOGI("=== osd_demo: AR0234 -> RGA -> libosd -> HDMI 720x480 NTSC ===\n");
+    LOGI("=== osd_demo: %s(cam%d) -> RGA -> libosd -> HDMI 720x480 NTSC ===\n",
+         o.cam.sensor == hw::CameraBase::Sensor::Ar0234M ? "AR0234" :
+         o.cam.sensor == hw::CameraBase::Sensor::Sc233hgsIsp ? "SC233HGS-ISP"
+                                                             : "SC233HGS",
+         o.cam.camera_index);
 
     /* keep the big cores at full speed: RT kernel + interactive governor
      * otherwise park at 408MHz under this bursty load */
@@ -177,7 +194,11 @@ int main(int argc, char **argv)
     hud.draw_crosshair(W / 2, H / 2, osd::kRed);
 
     st.color = osd::kWhite;
-    hud.draw_text(22, 10, "AR0234 1920x1200@60", st);
+    hud.draw_text(22, 10,
+        o.cam.sensor == hw::CameraBase::Sensor::Ar0234M ? "AR0234 1920x1200@60" :
+        o.cam.sensor == hw::CameraBase::Sensor::Sc233hgsIsp
+            ? "SC233HGS ISP NV12 1920x1200@60" : "SC233HGS 1920x1200@60 Y10",
+        st);
     st.color = osd::kCyan;
     hud.draw_text(22, 10 + osd::glyph_h() + 6, "RK3576 RGA OSD NTSC", st);
 
@@ -223,6 +244,9 @@ int main(int argc, char **argv)
     double t0 = now_ms(), t_stat = t0;
     double acc_det = 0, acc_rga = 0, acc_flip = 0, acc_dq = 0;
     int frames = 0;
+    uint64_t last_sof = 0;
+    double sof_dt_acc = 0;
+    int sof_dt_n = 0;
     LOGI("running...\n");
 
     while (g_run && (!o.frames || frames < o.frames)) {
@@ -233,6 +257,27 @@ int main(int argc, char **argv)
         if (!frame.valid()) break;
         acc_dq += now_ms() - tphase;
         tphase = now_ms();
+
+        /* SOF timestamp diagnostics: frame0 validation + mean frame
+         * interval measured in the driver's raw clock domain */
+        if (frame.sof_raw_ns) {
+            if (frames == 0) {
+                struct timespec rtn;
+                clock_gettime(CLOCK_REALTIME, &rtn);
+                const double age_ms =
+                    ((double)rtn.tv_sec * 1e3 + rtn.tv_nsec / 1e6) -
+                    (double)frame.epoch_ns / 1e6;
+                LOGI("frame0: seq=%u sof2epoch OK, age at DQBUF=%.2f ms, "
+                     "clock rate %+.2f ppm\n",
+                     frame.sequence, age_ms,
+                     (cam.clock().rate() - 1.0) * 1e6);
+            }
+            if (last_sof) {
+                sof_dt_acc += (double)(frame.sof_raw_ns - last_sof) / 1e6;
+                sof_dt_n++;
+            }
+            last_sof = frame.sof_raw_ns;
+        }
 
         const double t = frames / 60.0;
 
@@ -285,12 +330,20 @@ int main(int argc, char **argv)
             snprintf(buf, sizeof buf, "%3dM", hd);
             slot_draw(hud, slot_home, buf, osd::kAmber);
 
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
+            /* clock slot shows the frame's own SOF mapped to Epoch by
+             * sof2epoch - not the host wall clock read at draw time */
+            uint64_t ep = frame.epoch_ns;
+            if (!ep) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ep = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+            }
+            time_t ep_s = (time_t)(ep / 1000000000ull);
             struct tm tm;
-            localtime_r(&ts.tv_sec, &tm);
+            localtime_r(&ep_s, &tm);
             snprintf(buf, sizeof buf, "%02d:%02d:%02d.%d",
-                     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(ts.tv_nsec / 100000000UL));
+                     tm.tm_hour, tm.tm_min, tm.tm_sec,
+                     (int)((ep % 1000000000ull) / 100000000ull));
             slot_draw(hud, slot_time, buf, osd::kAmber);
 
             double fps = frames > 0 ? frames * 1000.0 / (now_ms() - t0) : 0;
@@ -418,9 +471,11 @@ int main(int argc, char **argv)
         double now = now_ms();
         if (now - t_stat >= 5000) {
             double fps = frames * 1000.0 / (now - t0);
-            LOGI("frames=%d fps=%.2f glyphs=%zu  dq=%.2fms det=%.2fms rga=%.2fms flip=%.2fms\n",
+            LOGI("frames=%d fps=%.2f glyphs=%zu  dq=%.2fms det=%.2fms rga=%.2fms flip=%.2fms"
+                 " sof_dt=%.3fms\n",
                  frames, fps, hud.glyph_cache_count(),
-                 acc_dq / frames, acc_det / frames, acc_rga / frames, acc_flip / frames);
+                 acc_dq / frames, acc_det / frames, acc_rga / frames, acc_flip / frames,
+                 sof_dt_n ? sof_dt_acc / sof_dt_n : 0.0);
             t_stat = now;
         }
     }

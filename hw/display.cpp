@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <ctime>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -270,17 +271,35 @@ bool HdmiDisplay::setup_overlay(const Config &cfg)
 bool HdmiDisplay::wait_flip(int timeout_ms)
 {
     if (!m_flip_pending) return true;
-    struct pollfd p = { m_fd, POLLIN, 0 };
-    if (poll(&p, 1, timeout_ms) <= 0) {
-        DISPE("flip poll timeout\n");
-        return false;
-    }
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     drmEventContext ctx = {};
     ctx.version = 2;
     ctx.page_flip_handler = page_flip_cb;
-    /* drmHandleEvent does its own read(): reading the fd here first would
-     * steal the event and leave it blocked forever inside drm_read() */
-    drmHandleEvent(m_fd, &ctx);
+
+    /* poll() can wake on a hotplug uevent, which drmHandleEvent silently
+     * drops without running the flip callback - keep draining until the
+     * flip event itself retires m_flip_pending or the budget runs out */
+    while (m_flip_pending) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const int left = timeout_ms -
+            (int)((now.tv_sec - t0.tv_sec) * 1000 +
+                  (now.tv_nsec - t0.tv_nsec) / 1000000);
+        if (left <= 0) {
+            DISPE("flip poll timeout\n");
+            return false;
+        }
+        struct pollfd p = { m_fd, POLLIN, 0 };
+        if (poll(&p, 1, left) < 0 && errno != EINTR) {
+            DISPE("flip poll: %s\n", strerror(errno));
+            return false;
+        }
+        /* drmHandleEvent does its own read(): reading the fd here first
+         * would steal the event and leave it blocked forever in drm_read() */
+        drmHandleEvent(m_fd, &ctx);
+    }
     return true;
 }
 
@@ -288,8 +307,10 @@ bool HdmiDisplay::present()
 {
     /* The page-flip event fires at vblank, but the kernel only retires the
      * atomic commit in its worker afterwards; a non-blocking commit issued
-     * in that window returns EBUSY. Wait it out instead of treating a
-     * transient EBUSY as fatal - that is what aborted long runs. */
+     * in that window returns EBUSY. The rk3576 VOP2 additionally returns a
+     * transient ENOSPC from its atomic check when window/bandwidth state is
+     * mid-transition. Wait both out instead of treating them as fatal -
+     * that is what aborted long runs. */
     for (int attempt = 0; attempt < 24; attempt++) {
         if (drmModePageFlip(m_fd, m_crtc_id, m_fb[m_back].fb_id,
                             DRM_MODE_PAGE_FLIP_EVENT, &m_flip_pending) == 0) {
@@ -297,7 +318,7 @@ bool HdmiDisplay::present()
             m_back ^= 1;
             return true;
         }
-        if (errno != EBUSY) {
+        if (errno != EBUSY && errno != ENOSPC) {
             DISPE("PageFlip: %s\n", strerror(errno));
             return false;
         }

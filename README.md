@@ -206,8 +206,9 @@ cmake -B build-x86 -DOSD_WITH_HW=OFF && cmake --build build-x86 -j && (cd build-
 （Betaflight 元素布局，只依赖 core）、`osd::hw`（V4L2/DRM/RGA）。
 依赖：`g++`、`pkg-config libdrm`、`~/workspace/librga`（librga 1.10.6）。
 
-ROS2 桥接见 `fpv_ws/src/osd_bridge`（订阅 apm_bridge 话题 → Pipeline 渲染线程
+ROS2 桥接在本仓库 `osd_bridge/`（订阅 apm_bridge 话题 → Pipeline 渲染线程
 → HDMI；检测框经 `Pipeline::set_boxes(BBoxRect)` 注入，ROS 话题映射后续再接）。
+板上部署：`ln -s ~/workspace/ar0234_osd_hdmi/osd_bridge ~/workspace/fpv_ws/src/osd_bridge`。
 
 ## 运行（板上）
 

@@ -1,0 +1,40 @@
+osd_bridge:
+  ros__parameters:
+    # ---- camera (RK3576 MIPI via hw::MipiCamera) ----
+    camera:
+      enabled: true
+      # 本机默认: sc233hgs-isp (NV12 via rkisp, 需 rkaiq_3A 运行)
+      # 其它: sc233hgs (Y10 raw) | ar0234 (VEYE GREY)
+      sensor: "sc233hgs-isp"
+      index: 0            # SC233HGS 模块号 0/1
+
+    # ---- HDMI output (DRM/KMS) ----
+    display:
+      device: "/dev/dri/card0"
+      width: 720          # NTSC 720x480p60
+      height: 480
+      overlay_alpha: 235  # 检测层 plane 全局 α
+
+    # ---- OSD 内容 ----
+    craft_name: "ROCKET"  # ASCII only
+    lipo_cells: 6         # 0 = 由整包电压推断
+    battery:
+      capacity_mah: 13000.0   # 与 apm_bridge battery.capacity_mah 保持一致；0 = 隐藏用量条
+    baro:
+      ground_ref: true    # 未解锁+落地时 EMA 记录地面气压作高度基准
+    home:
+      capture_on_arm: true    # 解锁瞬间记录 home，之后显示方向/距离
+
+    # ---- 检测框 ----
+    boxes:
+      sim: false          # 双目标模拟框 (板上无检测器时的验证)
+      canvas_space: false # set_boxes 注入坐标是否已是画布坐标
+
+    # ---- 渲染 ----
+    render:
+      pin_big_cores: true # performance governor + cpu4-7 亲和
+
+    # ---- 快照 ----
+    snapshot:
+      frame: -1           # 第 N 帧转储 back/hud/ovl 三件套, -1 关闭
+      dir: "/tmp"

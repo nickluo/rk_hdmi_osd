@@ -30,7 +30,7 @@ static Px px(const osd::Layer &l, int x, int y)
 int main()
 {
     osd::Layer l;
-    if (!l.init(720, 240)) { printf("init fail\n"); return 1; }
+    if (!l.init_auto(720, 240)) { printf("init fail\n"); return 1; }
     char d[160];
 
     /* ---- A. fill_rect stores the exact packed color ---- */
@@ -86,10 +86,10 @@ int main()
              kept, area, 100.0 * kept / area, holes);
     check(holes == 0 && kept > area / 2, "text composites over plate", d);
 
-    /* ---- D. draw_detect_box: plate fill present under the label ---- */
+    /* ---- D. draw_bbox: plate fill present under the label ---- */
     osd::Layer b;
-    if (!b.init(720, 240)) { printf("init2 fail\n"); return 1; }
-    osd::DetectBox db;
+    if (!b.init_auto(720, 240)) { printf("init2 fail\n"); return 1; }
+    osd::BBoxRect db;
     db.rect = {150, 120, 100, 70};
     db.label = "UAV";
     db.tag = "T01";
@@ -97,7 +97,7 @@ int main()
     db.color = osd::kRed;
     db.alpha = 160;
     db.plate_opaque = true;
-    osd::Rect painted = b.draw_detect_box(db);
+    osd::Rect painted = b.draw_bbox(db);
 
     /* plate sits above the box: {r.x, r.y - FONT_H - 8, tw + 12, FONT_H + 6} */
     const int py = db.rect.y - osd::glyph_h() - 8;

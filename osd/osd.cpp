@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cmath>
 #include <cerrno>
+#include <new>
 #include <utility>
 #include <fcntl.h>
 #include <unistd.h>
@@ -148,7 +149,31 @@ bool Layer::attach(int dma_fd, void *va, int w, int h, size_t size)
     m_fd = dma_fd;
     m_va = va;
     m_attached = true;
+    m_wc = true;              /* DRM dumb buffers are mapped write-combine */
     return init_i();
+}
+
+bool Layer::init_mem(int w, int h)
+{
+    shutdown();
+    m_w = w; m_h = h;
+    m_size = (size_t)w * h * 4;
+    m_px = new (std::nothrow) uint32_t[(size_t)w * h];
+    if (!m_px) return false;
+    m_va = m_px;
+    m_fd = -1;
+    m_heap = true;
+    m_attached = true;        /* shutdown() must not munmap/close anything */
+    return init_i();
+}
+
+bool Layer::init_auto(int w, int h)
+{
+    if (init(w, h))
+        return true;
+    /* dma-heap unavailable (x86 dev machine, container): drop to memory.
+     * Any consumer that needs a dmabuf (RGA import) must use init(). */
+    return init_mem(w, h);
 }
 
 bool Layer::init_i()
@@ -168,13 +193,17 @@ void Layer::shutdown()
     m_sets_used = 0;
     m_cache_count = 0;
     if (m_base) { delete[] m_base; m_base = nullptr; }
-    if (!m_attached) {
+    if (m_heap) {
+        delete[] m_px;
+    } else if (!m_attached) {
         if (m_va) munmap(m_va, m_size);
         if (m_fd >= 0) close(m_fd);
     }
     m_va = nullptr; m_px = nullptr; m_fd = -1;
     m_w = m_h = 0; m_size = 0;
     m_attached = false;
+    m_heap = false;
+    m_wc = false;
 }
 
 void Layer::set_base()
@@ -225,8 +254,6 @@ void Layer::end_frame()
 /* glyph cache                                                         */
 /* ------------------------------------------------------------------ */
 /* glyph canvas is glyph + 2px outline on every side */
-static constexpr int GW = FONT_W + 4;
-static constexpr int GH = FONT_H + 4;
 static constexpr int OUT = 2;
 
 const Layer::Glyph *Layer::glyph(char c, const TextStyle &st) const
@@ -235,16 +262,22 @@ const Layer::Glyph *Layer::glyph(char c, const TextStyle &st) const
         c = '?';
     int idx = c - FONT_FIRST;
     const bool outlined = st.outline;
+    const bool small = st.small;
 
-    /* find or create the glyph set for this color (outline variants share
-     * the set: outlined glyphs are strictly better, cache both keyed by
-     * (idx, outlined) inside one set via offset trick is overkill - just
-     * include outline bit in the color match below) */
+    const int fw = small ? FONT_W_SMALL : FONT_W;
+    const int fh = small ? FONT_H_SMALL : FONT_H;
+    const int GW = fw + 4, GH = fh + 4;
+    const unsigned char *atlas = small ? FONT_ATLAS_SMALL[idx] : FONT_ATLAS[idx];
+
+    /* find or create the glyph set for this (color, outline, size). The
+     * outline and size bits travel in color.a bits 0/1 - apps always draw
+     * text at a=255 so those bits are free */
     GlyphSet *set = nullptr;
+    const uint8_t style_bits = (uint8_t)outlined | ((uint8_t)small << 1);
     for (size_t s = 0; s < m_sets_used; s++) {
         if (m_sets[s].color.r == st.color.r && m_sets[s].color.g == st.color.g &&
             m_sets[s].color.b == st.color.b &&
-            (m_sets[s].color.a & 1) == (uint8_t)outlined) {
+            (m_sets[s].color.a & 3) == style_bits) {
             set = &m_sets[s];
             break;
         }
@@ -255,7 +288,7 @@ const Layer::Glyph *Layer::glyph(char c, const TextStyle &st) const
         else
             set = &m_sets[m_sets_used++];
         set->color = st.color;
-        set->color.a = (set->color.a & 0xFE) | (uint8_t)outlined;
+        set->color.a = (uint8_t)((set->color.a & 0xFC) | style_bits);
         memset(set->has, 0, sizeof(set->has));
         memset(set->glyph, 0, sizeof(set->glyph));
     }
@@ -264,9 +297,9 @@ const Layer::Glyph *Layer::glyph(char c, const TextStyle &st) const
 
     /* render: solid black outline (thresholded dilation - crisp edge, no
      * translucent halo), then the antialiased colored core on top */
-    const unsigned char *atlas = FONT_ATLAS[idx];
-    Glyph *g = new Glyph();
-    memset(g, 0, sizeof(*g));
+    Glyph *g = new Glyph();           /* value-init zeroes px/binary */
+    g->cw = GW;
+    g->ch = GH;
     const uint32_t core = pack(st.color);
     const uint32_t outline = pack(Color{0, 0, 0, 255});
 
@@ -274,11 +307,11 @@ const Layer::Glyph *Layer::glyph(char c, const TextStyle &st) const
         for (int dy = -OUT; dy <= OUT; dy++) {
             for (int dx = -OUT; dx <= OUT; dx++) {
                 if (dx == 0 && dy == 0) continue;
-                for (int gy = 0; gy < FONT_H; gy++) {
+                for (int gy = 0; gy < fh; gy++) {
                     int ty = gy + OUT + dy, tx0 = OUT + dx;
                     if (ty < 0 || ty >= GH) continue;
-                    for (int gx = 0; gx < FONT_W; gx++) {
-                        if (atlas[gy * FONT_W + gx] < 48) continue;
+                    for (int gx = 0; gx < fw; gx++) {
+                        if (atlas[gy * fw + gx] < 48) continue;
                         int tx = tx0 + gx;
                         if (tx < 0 || tx >= GW) continue;
                         g->px[ty][tx] = outline;
@@ -287,9 +320,9 @@ const Layer::Glyph *Layer::glyph(char c, const TextStyle &st) const
             }
         }
     }
-    for (int gy = 0; gy < FONT_H; gy++) {
-        for (int gx = 0; gx < FONT_W; gx++) {
-            uint8_t a = atlas[gy * FONT_W + gx];
+    for (int gy = 0; gy < fh; gy++) {
+        for (int gx = 0; gx < fw; gx++) {
+            uint8_t a = atlas[gy * fw + gx];
             if (!a) continue;
             /* alpha lives in bits[31:24] of the packed RGBA value */
             const uint32_t src = (core & 0x00FFFFFFu) | ((uint32_t)a << 24);
@@ -392,10 +425,12 @@ void Layer::draw_line(int x0, int y0, int x1, int y1, Color c, int t)
 void Layer::draw_text(int x, int y, const char *s, const TextStyle &st)
 {
     if (!s) return;
-    const bool fast = !m_attached;         /* see blit_row_binary */
-    const int step = FONT_W + st.tracking;
+    const bool fast = !m_wc;               /* see blit_row_binary */
+    const int fw = st.small ? FONT_W_SMALL : FONT_W;
+    const int step = fw + st.tracking;
     for (; *s; s++, x += step) {
         const Glyph *g = glyph(*s, st);
+        const int GW = g->cw, GH = g->ch;
         /* clip vertically fast-path */
         if (y + GH <= 0 || y >= m_h) continue;
         for (int gy = 0; gy < GH; gy++) {
@@ -430,27 +465,53 @@ int Layer::text_width(const char *s, const TextStyle &st) const
 {
     int n = 0;
     for (; s && *s; s++) n++;
-    return n ? n * FONT_W + (n - 1) * st.tracking : 0;
+    if (!n) return 0;
+    const int fw = st.small ? FONT_W_SMALL : FONT_W;
+    return n * fw + (n - 1) * st.tracking;
 }
 
 /* ------------------------------------------------------------------ */
 /* composite elements                                                  */
 /* ------------------------------------------------------------------ */
-void Layer::draw_crosshair(int cx, int cy, Color c)
+void Layer::draw_crosshair(int cx, int cy, Color c, int r)
 {
-    const int gap = 14, arm = 64;
+    const int gap = r / 2, arm = r + r / 2;
     fill_rect({cx - gap - arm, cy - 1, arm, 2}, c);
     fill_rect({cx + gap,      cy - 1, arm, 2}, c);
     fill_rect({cx - 1, cy - gap - arm, 2, arm}, c);
     fill_rect({cx - 1, cy + gap,      2, arm}, c);
     for (int a = 0; a < 360; a += 3) {
         float rad = a * 3.14159265f / 180.0f;
-        int x = cx + (int)(36 * cosf(rad));
-        int y = cy + (int)(36 * sinf(rad));
+        int x = cx + (int)(r * cosf(rad));
+        int y = cy + (int)(r * sinf(rad));
         if (x >= 0 && y >= 0 && x < m_w && y < m_h)
             m_px[(size_t)y * m_w + x] = pack(c);
     }
     fill_rect({cx - 2, cy - 2, 4, 4}, c);
+    m_dirty = true;
+}
+
+void Layer::draw_horizon(int cx, int cy, float pitch_deg, float roll_deg,
+                         Color c, int px_per_deg, int half_span)
+{
+    /* pitch ladder, rungs every 5 deg (10 deg rungs longer), rotated by
+     * -roll about the centre. Pitch positive = nose up -> the visible
+     * ladder slides down, matching a real attitude indicator. */
+    const float rad = -roll_deg * 3.14159265f / 180.0f;
+    const float cs = cosf(rad), sn = sinf(rad);
+    for (int rung = -20; rung <= 20; rung += 5) {
+        if (rung == 0)
+            continue;               /* the 0 line is the center reticle */
+        const float dy = (rung - pitch_deg) * px_per_deg;
+        if (fabsf(dy) > 90.f)
+            continue;               /* outside the visible window */
+        const int len = (rung % 10 == 0) ? half_span : half_span / 2;
+        const int x0 = cx + (int)((-len) * cs - dy * sn);
+        const int y0 = cy + (int)((-len) * sn + dy * cs);
+        const int x1 = cx + (int)(( len) * cs - dy * sn);
+        const int y1 = cy + (int)(( len) * sn + dy * cs);
+        draw_line(x0, y0, x1, y1, c, 2);
+    }
     m_dirty = true;
 }
 
@@ -488,7 +549,7 @@ void Layer::draw_warning(int x, int y, const char *s, bool blink_on)
     draw_text(x, y, s, st);
 }
 
-Rect Layer::draw_detect_box(const DetectBox &b)
+Rect Layer::draw_bbox(const BBoxRect &b)
 {
     const Rect &r = b.rect;
     const int t = b.locked ? 3 : 2;
@@ -510,6 +571,10 @@ Rect Layer::draw_detect_box(const DetectBox &b)
     Rect plate = {r.x, r.y - FONT_H - 8, tw + 12, FONT_H + 6};
     if (plate.y < 0)
         plate.y = r.y + r.h + 2;                    /* flip below the box */
+    if (plate.x + plate.w > m_w)                    /* keep inside the right */
+        plate.x = r.x + r.w - plate.w;              /* edge (plate > box)   */
+    if (plate.x < 0)
+        plate.x = 0;
 
     /* ---- draw ---- */
     if (b.kind == BoxKind::Full) {

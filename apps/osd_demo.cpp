@@ -404,7 +404,7 @@ int main(int argc, char **argv)
             if (tg.prev_rect.w > 0)
                 det.clear(tg.prev_rect);
         for (auto &tg : targets) {
-            osd::DetectBox db;
+            osd::BBoxRect db;
             db.rect = tg.rect;
             db.label = tg.label;
             db.tag = tg.tag;
@@ -416,7 +416,7 @@ int main(int argc, char **argv)
             /* exact painted bounds (plate can be much wider than the box)
              * +2px margin for line stamps; this is the clear footprint for
              * the next frame - no more colored trails on movement */
-            osd::Rect painted = det.draw_detect_box(db);
+            osd::Rect painted = det.draw_bbox(db);
             tg.prev_rect = {painted.x - 2, painted.y - 2,
                             painted.w + 4, painted.h + 4};
         }

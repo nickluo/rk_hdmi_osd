@@ -15,7 +15,7 @@ LDFLAGS  := -Wl,-rpath=$(LIBRGA)/libs/Linux/gcc-aarch64
 all: osd_demo
 
 # ---- libosd ----
-osd/osd.o: osd/osd.cpp osd/osd.h osd_font.h
+osd/osd.o: osd/osd.cpp osd/osd.h osd/osd_font.h
 	@mkdir -p osd
 	$(CXX) $(CXXFLAGS) -c osd/osd.cpp -o $@
 
@@ -35,11 +35,14 @@ hw/display.o: hw/display.cpp hw/display.h hw/image.h
 hw/compositor.o: hw/compositor.cpp hw/compositor.h hw/image.h
 	$(CXX) $(CXXFLAGS) -c hw/compositor.cpp -o $@
 
-libhw.a: hw/camera.o hw/sof2epoch.o hw/display.o hw/compositor.o
+hw/dmabuf.o: hw/dmabuf.cpp hw/dmabuf.h
+	$(CXX) $(CXXFLAGS) -c hw/dmabuf.cpp -o $@
+
+libhw.a: hw/camera.o hw/sof2epoch.o hw/display.o hw/compositor.o hw/dmabuf.o
 	ar rcs $@ $^
 
-osd_demo: osd_demo.cpp libosd.a libhw.a osd/osd.h hw/camera.h hw/display.h hw/compositor.h
-	$(CXX) $(CXXFLAGS) osd_demo.cpp libosd.a libhw.a -o $@ $(LDFLAGS) $(LDLIBS)
+osd_demo: apps/osd_demo.cpp libosd.a libhw.a osd/osd.h hw/camera.h hw/display.h hw/compositor.h
+	$(CXX) $(CXXFLAGS) apps/osd_demo.cpp libosd.a libhw.a -o $@ $(LDFLAGS) $(LDLIBS)
 
 # ---- probes & tests, none of them part of `all` ----
 # camera-only smoke test (no DRM/HDMI needed)
@@ -62,6 +65,6 @@ probes: probe8 probe9 probe10
 
 clean:
 	rm -f osd_demo probe8 probe9 probe10 libosd.a osd/osd.o \
-	      libhw.a hw/camera.o hw/sof2epoch.o hw/display.o hw/compositor.o
+	      libhw.a hw/camera.o hw/sof2epoch.o hw/display.o hw/compositor.o hw/dmabuf.o
 
 .PHONY: all clean probes

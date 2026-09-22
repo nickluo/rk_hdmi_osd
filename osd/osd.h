@@ -42,12 +42,15 @@ constexpr Color kAmber {255, 200, 60, 255};
 constexpr Color kRed   {255, 70, 70, 255};
 constexpr Color kGreen {90, 230, 90, 255};
 constexpr Color kCyan  {80, 220, 255, 255};
+constexpr Color kBlue  {90, 150, 255, 255};
 
 struct Rect { int x = 0, y = 0, w = 0, h = 0; };
 
-/* font geometry (16x32 AA mono font) */
+/* font geometry: normal 16x32 AA mono, small 8x16 AA mono */
 constexpr int glyph_w() { return FONT_W; }
 constexpr int glyph_h() { return FONT_H; }
+constexpr int glyph_w_small() { return FONT_W_SMALL; }
+constexpr int glyph_h_small() { return FONT_H_SMALL; }
 
 struct TextStyle {
     Color color = kWhite;
@@ -57,6 +60,7 @@ struct TextStyle {
      * alpha<255 into a white fringe. Unoutlined text keeps true AA and is
      * only safe on a DRM plane (exact VOP blending) or over an opaque fill. */
     bool outline = true;
+    bool small = false;        /* 8x16 atlas: secondary info */
     int  tracking = 0;         /* extra pixels between characters */
 };
 
@@ -68,7 +72,11 @@ enum class BoxKind {
     Full,                      /* full rectangle outline */
 };
 
-struct DetectBox {
+/* BBoxRect - the dynamic detection-box input type. Color may change every
+ * frame at no cost: brackets/plate are rasterised per call and the label
+ * text is always fixed opaque white, so box colors never touch the glyph
+ * cache. This is the type the layout engine and the ROS bridge inject. */
+struct BBoxRect {
     Rect rect;                 /* pixel coords on the OSD canvas */
     const char *label = "";    /* class name, e.g. "UAV" */
     const char *tag = "";      /* short tag, e.g. "T01" or "LCK" */
@@ -99,14 +107,21 @@ public:
     Layer &operator=(const Layer &) = delete;
 
     /* allocate RGBA8888 canvas on a dma-heap (cached heap is fine:
-     * end_frame() performs the explicit cache clean). */
+     * end_frame() performs the explicit cache clean). Strict: the board
+     * pipeline REQUIRES a dmabuf (RGA imports it) - never fall back. */
     bool init(int w, int h,
               const char *heap_path = "/dev/dma_heap/system");
+    /* plain heap-memory backing (no dmabuf, dma_fd() == -1). For host-side
+     * tests/tools on machines without /dev/dma_heap - anything fed to RGA
+     * must NOT use this. */
+    bool init_mem(int w, int h);
+    /* dma-heap first, plain memory when unavailable (tests, probes). */
+    bool init_auto(int w, int h);
     /* wrap an externally-owned buffer (e.g. a DRM dumb buffer mapped by the
      * caller) instead of allocating; shutdown() will not free it */
     bool attach(int dma_fd, void *va, int w, int h, size_t size);
     void shutdown();
-    bool valid() const { return m_fd >= 0; }
+    bool valid() const { return m_va != nullptr; }
 
     int width()  const { return m_w; }
     int height() const { return m_h; }
@@ -134,8 +149,23 @@ public:
     /* ---------------------------------------------------------------- */
     /* composite elements (Betaflight-inspired + AI interception)      */
     /* ---------------------------------------------------------------- */
-    /* center reticle: cross with gap + circle + dot */
-    void draw_crosshair(int cx, int cy, Color c);
+    /* center reticle: cross with gap + circle + dot. `r` is the circle
+     * radius; arms/cross scale from it (default = compact FPV reticle). */
+    void draw_crosshair(int cx, int cy, Color c, int r = 22);
+
+    /* pitch-ladder artificial horizon centred on (cx, cy): rungs every
+     * 5 deg (10 deg rungs longer), translated by pitch (positive = nose
+     * up -> ladder slides down) and rotated by roll (positive = right
+     * roll -> ladder rotates clockwise... reads best combined with the
+     * center reticle drawn over it). Caller restores the region each
+     * update - use horizon_region() for the restore footprint. */
+    void draw_horizon(int cx, int cy, float pitch_deg, float roll_deg,
+                      Color c, int px_per_deg = 5, int half_span = 80);
+
+    /* restore footprint covering every line draw_horizon may paint at
+     * any pitch/roll within +/-20 deg */
+    static constexpr Rect horizon_region(int cx, int cy)
+    { return Rect{cx - 128, cy - 100, 256, 200}; }
 
     /* home-direction arrow, angle 0 = up, clockwise degrees */
     void draw_home_arrow(int cx, int cy, float angle_deg, Color c, int size = 22);
@@ -147,11 +177,11 @@ public:
     /* flashing warning text (caller passes blink phase) */
     void draw_warning(int x, int y, const char *s, bool blink_on);
 
-    /* AI detection box: corners, label bar w/ class+conf+tag, lock pulse.
-     * Returns the exact painted bounds (everything touched: brackets, echo
-     * frame, label plate incl. border) - use it as the clear footprint for
-     * the next frame so moving boxes never leave colored trails. */
-    Rect draw_detect_box(const DetectBox &b);
+    /* AI detection box (BBoxRect): corners, label bar w/ class+conf+tag,
+     * lock pulse. Returns the exact painted bounds (everything touched:
+     * brackets, echo frame, label plate incl. border) - use it as the clear
+     * footprint for the next frame so moving boxes never leave trails. */
+    Rect draw_bbox(const BBoxRect &b);
 
     /* ---------------------------------------------------------------- */
     /* frame lifecycle & RGA integration                               */
@@ -180,9 +210,10 @@ private:
     struct Glyph {
         uint32_t px[FONT_H + 4][FONT_W + 4];   /* glyph + 2px outline */
         uint32_t binary;                       /* alpha only 0 or 255 */
+        int cw = 0, ch = 0;                    /* cell dims (small font smaller) */
     };
-    /* one glyph table per color in use, built lazily; apps use a handful of
-     * colors so a linear scan is cheaper than a hash map */
+    /* one glyph table per (color, outlined, small) in use, built lazily;
+     * apps use a handful of styles so a linear scan is cheaper than a map */
     struct GlyphSet {
         Color color;
         bool  has[95] = {};
@@ -203,6 +234,8 @@ private:
     uint32_t m_frames = 0;
     bool     m_dirty = false;
     bool     m_attached = false;   /* buffer owned by caller */
+    bool     m_heap = false;       /* plain new[] backing (no dmabuf) */
+    bool     m_wc = false;         /* write-combine (attached DRM dumb) */
     uint32_t *m_base = nullptr;
 };
 

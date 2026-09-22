@@ -179,11 +179,11 @@ invalidate、检测框每帧仅清旧足迹区域。
 | `gen_font.py` | 用 PIL 生成 16x32 + 8x16 双字号抗锯齿 ASCII 字库（本地跑） |
 | `osd/osd_font.h` | 生成的字库点阵 |
 | `probe*.cpp` | 探针：`probe8` libosd 回归、`probe9` RGA 能力/优化、`probe10` 光栅微基准 |
-| `Makefile` | 板上编译（fps 回归基准；CMake 版验证后移除） |
+| `CMakeLists.txt` | 构建（standalone 或被 osd_bridge 包 `add_subdirectory`） |
 
 ## 编译（板上）
 
-CMake（推荐；osd_bridge 包经 `add_subdirectory` 复用同一套目标）：
+CMake（osd_bridge 包经 `add_subdirectory` 复用同一套目标）：
 
 ```bash
 cd ~/workspace/ar0234_osd_hdmi
@@ -192,13 +192,9 @@ cmake --build build -j
 (cd build && ctest)        # probe8 回归 + layout 快照测试
 ```
 
-Makefile（板上 fps 回归基准，验证 CMake 版 59.8fps 后移除）：
-
-```bash
-cd ~/workspace/ar0234_osd_hdmi
-make LIBRGA=/home/firefly/workspace/librga            # libosd.a + libhw.a + osd_demo
-make LIBRGA=/home/firefly/workspace/librga probes     # probe8/9/10（不在默认目标里）
-```
+板上回归实测（SC233HGS-ISP 自由跑 + HDMI，600 帧）：CMake 版 59.45 fps /
+旧 Makefile 版 59.35 fps，rga/det/sof_dt 一致 —— CMake 化无性能回退，旧
+Makefile 已移除。
 
 x86 主机（可移植子集，无 libdrm/librga 依赖）：
 

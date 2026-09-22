@@ -84,8 +84,8 @@ osd::Layer osd;
 osd.init(720, 480);                       // cached dma-heap + RGA import
 
 osd.begin_frame();
-osd.draw_detect_box({.rect={x,y,w,h}, .label="UAV", .tag="T01",
-                     .conf=0.97, .color=osd::kRed, .locked=true});
+osd.draw_bbox({.rect={x,y,w,h}, .label="UAV", .tag="T01",
+               .conf=0.97, .color=osd::kRed, .locked=true});
 osd.draw_text(24, 10, "ALT 102M", {.color=osd::kWhite});
 osd.draw_home_arrow(360, 58, angle_deg, osd::kAmber);
 osd.draw_bar(20, 350, 150, 12, link_frac, kGreen, kBlack);
@@ -105,7 +105,8 @@ IM_STATUS st = imblend(osd.rga_buf(), fb, IM_ALPHA_BLEND_SRC_OVER, 1);
 | `draw_warning` | OSD_WARNINGS | 闪烁告警（~3.3Hz 内置相位） |
 | `draw_bar` | OSD_LINK_QUALITY / OSD_MAIN_BATT_USAGE | 链路/电量条 |
 | `draw_text` + TextSlot 模式 | OSD_FLYMODE / OSD_ALTITUDE / OSD_RTC_DATETIME / OSD_TIMER 等 | 变更驱动重绘 |
-| `draw_detect_box` | （新增） | **AI 检测框**：角标/全框、标签+置信度+track id、威胁配色、锁定脉冲菱形+外圈 |
+| `draw_bbox` | （新增） | **AI 检测框（BBoxRect）**：角标/全框、标签+置信度+track id、威胁配色、锁定脉冲菱形+外圈；颜色逐帧可变 |
+| `draw_horizon` | （新增） | 俯仰梯水平仪（配 `draw_crosshair`） |
 | 模式横幅 | OSD_FLYMODE | SEARCH/TRACK/INTERCEPT |
 
 **低 CPU 设计**：字形缓存（字符×颜色预渲染含描边 → 绘制退化为行 memcpy）、
@@ -170,13 +171,28 @@ invalidate、检测框每帧仅清旧足迹区域。
 | `hw/sof2epoch.h` `hw/sof2epoch.cpp` | `hw::Sof2Epoch`：CLOCK_MONOTONIC_RAW(SOF) → CLOCK_REALTIME(Epoch) 线性模型转换器（后台校准线程） |
 | `hw/display.h` `hw/display.cpp` | `hw::HdmiDisplay`：DRM/KMS 双缓冲 + overlay plane |
 | `hw/compositor.h` `hw/compositor.cpp` | `hw::Compositor`：**全工程唯一使用 RGA 的地方**，封装 NV12 中转与三步硅后端 |
-| `osd_demo.cpp` | 全功能演示：管线编排 + libosd + 模拟双目标 AI 检测 + 遥测 |
-| `gen_font.py` | 用 PIL 生成 16x32 抗锯齿 ASCII 字库（本地跑） |
-| `osd_font.h` | 生成的字库点阵 |
+| `hw/dmabuf.h` `hw/dmabuf.cpp` | `hw::DmaBuf`：dma-heap 分配小工具（bridge 台架模式灰帧用） |
+| `layout/telemetry.h` | `osd::layout::Telemetry`：ROS 无关的遥测快照 POD |
+| `layout/layout.h` `layout/layout.cpp` | **osd::layout**：Betaflight 元素布局引擎（TextSlot 变更驱动、水平仪、消息行、框足迹清除），只依赖 libosd |
+| `apps/osd_demo.cpp` | 全功能演示：管线编排 + libosd + 模拟双目标 AI 检测 + 遥测 |
+| `tests/test_layout_snapshot.cpp` | layout 快照回归（x86 可跑，输出 PPM + 断言） |
+| `gen_font.py` | 用 PIL 生成 16x32 + 8x16 双字号抗锯齿 ASCII 字库（本地跑） |
+| `osd/osd_font.h` | 生成的字库点阵 |
 | `probe*.cpp` | 探针：`probe8` libosd 回归、`probe9` RGA 能力/优化、`probe10` 光栅微基准 |
-| `Makefile` | 板上编译 |
+| `Makefile` | 板上编译（fps 回归基准；CMake 版验证后移除） |
 
 ## 编译（板上）
+
+CMake（推荐；osd_bridge 包经 `add_subdirectory` 复用同一套目标）：
+
+```bash
+cd ~/workspace/ar0234_osd_hdmi
+cmake -B build -DLIBRGA_ROOT=~/workspace/librga -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+(cd build && ctest)        # probe8 回归 + layout 快照测试
+```
+
+Makefile（板上 fps 回归基准，验证 CMake 版 59.8fps 后移除）：
 
 ```bash
 cd ~/workspace/ar0234_osd_hdmi
@@ -184,7 +200,18 @@ make LIBRGA=/home/firefly/workspace/librga            # libosd.a + libhw.a + osd
 make LIBRGA=/home/firefly/workspace/librga probes     # probe8/9/10（不在默认目标里）
 ```
 
+x86 主机（可移植子集，无 libdrm/librga 依赖）：
+
+```bash
+cmake -B build-x86 -DOSD_WITH_HW=OFF && cmake --build build-x86 -j && (cd build-x86 && ctest)
+```
+
+库目标：`osd::core`（纯 CPU 光栅 + BBoxRect，零厂商依赖）、`osd::layout`
+（Betaflight 元素布局，只依赖 core）、`osd::hw`（V4L2/DRM/RGA）。
 依赖：`g++`、`pkg-config libdrm`、`~/workspace/librga`（librga 1.10.6）。
+
+ROS2 桥接见 `fpv_ws/src/osd_bridge`（订阅 apm_bridge 话题 → Pipeline 渲染线程
+→ HDMI；检测框经 `Pipeline::set_boxes(BBoxRect)` 注入，ROS 话题映射后续再接）。
 
 ## 运行（板上）
 

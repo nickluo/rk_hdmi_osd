@@ -34,8 +34,14 @@ find_package(mavros_msgs REQUIRED)
 # ---- the osd stack: one colcon build produces everything ---------------
 # Default: this package lives INSIDE the ar0234_osd_hdmi checkout (the
 # parent of this directory), so one sync serves both the libs and the node.
+# The package is typically reached through a symlink from the ROS
+# workspace src/: resolve THIS directory's real path first, then take its
+# parent (CMake REALPATH lexical-collapses "symlink/.." before resolving,
+# so a plain "${CMAKE_CURRENT_SOURCE_DIR}/.. REALPATH" lands in src/).
 # Override -DOSD_STACK_ROOT=<path> only for split layouts.
-set(OSD_STACK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH
+get_filename_component(_pkg_real "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
+get_filename_component(_osd_stack_default "${_pkg_real}" DIRECTORY)
+set(OSD_STACK_ROOT "${_osd_stack_default}" CACHE PATH
     "ar0234_osd_hdmi checkout (the osd hw/osd/layout libraries)")
 set(LIBRGA_ROOT "$ENV{HOME}/workspace/librga" CACHE PATH "librga SDK root")
 if(NOT EXISTS "${LIBRGA_ROOT}/include/im2d.hpp")
